@@ -17,6 +17,8 @@ from .ollama import OllamaClient
 from .parser import ProjectParser
 from .diagram_fix import fix_mermaid,is_mermaid_valid
 from .schemas import AnalysisResponse
+from .llm_steps import process_with_steps, fallback_generation
+from .graph_cleaner import ensure_valid
 
 
 app = FastAPI(title="AI Code Architecture & Flow Diagram Generator")
@@ -78,25 +80,51 @@ async def upload_project(file: UploadFile = File(...)) -> AnalysisResponse:
         project_data = parser.parse_zip(zip_path)
         print("DEBUG 7: Parser output keys:", list(project_data.keys()))
 
-        print("DEBUG 8: Building LLM prompt...")
-        prompt = build_prompt(project_data)
-        print("DEBUG 9: Prompt length =", len(prompt))
+        file_count = len(project_data.get("files", []))
+        relationship_count = len(project_data.get("relationships", []))
+        print("DEBUG 7A: File count detected:", file_count)
+        print("DEBUG 7B: Relationship count detected:", relationship_count)
 
-        print("DEBUG 10: Calling Ollama model:", ollama_client.model)
-        ollama_output = ollama_client.generate(prompt)
-        print("DEBUG 11: Ollama returned output length:", len(ollama_output))
+        try:
+            print("DEBUG 8: Starting process_with_steps() pipeline...")
+            diagram, summary = process_with_steps(project_data, ollama_client)
+            print("DEBUG 9: Diagram length before validation =", len(diagram))
+            print("DEBUG 10: Summary length before validation =", len(summary))
+        except Exception as pipeline_exc:
+            print("DEBUG LLM PIPELINE ERROR:", repr(pipeline_exc))
+            diagram, summary = fallback_generation(project_data)
+            print("DEBUG 8B: Fallback generation used after pipeline error.")
 
-        print("DEBUG 12: Parsing Ollama JSON...")
-        diagram, summary = parse_ollama_output(ollama_output)
-        print("DEBUG 13: JSON parse successful.")
-
-        # 🔥 FIX MERMAID BEFORE RETURN
-        # Only repair if the model produced junk
-        if not is_mermaid_valid(diagram):
-            print("⚠ Diagram invalid → applying fix_mermaid()")
+        validation_metadata = {"fixed": False, "valid": is_mermaid_valid(diagram)}
+        try:
+            if not validation_metadata["valid"]:
+                print("⚠ Diagram invalid → applying fix_mermaid()")
+                diagram, validation_metadata = ensure_valid(diagram)
+                print("DEBUG 11: ensure_valid metadata:", validation_metadata)
+                if not validation_metadata.get("valid"):
+                    print("DEBUG 11B: ensure_valid failed, applying hard fallback diagram.")
+                    diagram = "flowchart TD\n  A[Analysis Complete]\n  B[See Summary]\n  A --> B"
+            else:
+                print("✔ Diagram already valid, skipping fix.")
+        except Exception as ensure_exc:
+            print("DEBUG ERROR ensure_valid:", repr(ensure_exc))
             diagram = fix_mermaid(diagram)
+            validation_metadata = {"fixed": True, "valid": is_mermaid_valid(diagram)}
+            if not validation_metadata.get("valid"):
+                print("DEBUG 11C: fix_mermaid fallback still invalid, forcing hard fallback diagram.")
+                diagram = "flowchart TD\n  A[Analysis Complete]\n  B[See Summary]\n  A --> B"
+
+        if not summary or len(summary) < 20:
+            summary = (
+                f"This project contains {file_count} files and {relationship_count} relationships. "
+                "Review the generated flowchart for architecture context."
+            )
+            print("DEBUG 12: Summary fallback applied.")
         else:
-            print("✔ Diagram already valid, skipping fix.")
+            print("DEBUG 12: Summary passed minimum length check.")
+
+        print("DEBUG 13: Validation complete. Final diagram length:", len(diagram))
+        print("DEBUG 14: Final summary length:", len(summary))
 
 
     except HTTPException as exc:
