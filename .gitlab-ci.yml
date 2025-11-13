@@ -1,0 +1,25 @@
+stages:
+  - backend-test
+  - frontend-build
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "off"
+
+backend-test:
+  stage: backend-test
+  image: python:3.10
+  script:
+    - pip install --upgrade pip
+    - pip install -r backend/requirements.txt
+    - pytest backend/tests
+
+frontend-build:
+  stage: frontend-build
+  image: node:20
+  script:
+    - cd frontend
+    - npm install
+    - npm run build
+
+
