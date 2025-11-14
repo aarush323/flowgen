@@ -33,7 +33,6 @@ JS_CALL_RE = re.compile(r"\b(?P<caller>\w+)\s*\(", re.MULTILINE)
 class ProjectParser:
     SUPPORTED_EXTENSIONS = {".py", ".js", ".jsx"}
 
-    # Folders that must NEVER be parsed
     SKIP_FOLDERS = {
         ".venv", "venv", "env",
         "__pycache__",
@@ -47,9 +46,9 @@ class ProjectParser:
         "static", "public",
     }
 
-    # Absolute safety limit → prevents prompt explosion
     MAX_FILES = 150
 
+    # ==============================================================================
     def parse_zip(self, zip_path: Path) -> dict[str, Any]:
         extract_dir = zip_path.parent / "extracted"
         extract_dir.mkdir(exist_ok=True)
@@ -57,22 +56,17 @@ class ProjectParser:
         with zipfile.ZipFile(zip_path, "r") as archive:
             archive.extractall(extract_dir)
 
-        files_data: list[dict[str, Any]] = []
-        file_index: dict[str, dict[str, Any]] = {}
+        files_data = []
+        file_index = {}
 
         for file_path in extract_dir.rglob("*"):
 
-            # Skip blacklisted directories
             if any(skip in {p.lower() for p in file_path.parts} for skip in self.SKIP_FOLDERS):
                 continue
-
             if not file_path.is_file():
                 continue
-
             if file_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
                 continue
-
-            # Enforce max-files limit
             if len(files_data) >= self.MAX_FILES:
                 break
 
@@ -86,163 +80,118 @@ class ProjectParser:
             files_data.append(file_info)
             file_index[relative] = file_info
 
-        # NEW: Build function-level data
         all_functions = self._extract_all_functions(files_data)
         function_relationships = self._build_function_relationships(files_data, file_index)
-        
-        # Keep old file-level relationships for backward compatibility
         file_relationships = self._build_file_relationships(files_data, file_index)
 
         return {
             "files": files_data,
-            "functions": all_functions,  # NEW: Function list
-            "relationships": function_relationships,  # NEW: Function-level calls
-            "file_relationships": file_relationships,  # OLD: For backward compat
+            "functions": all_functions,
+            "relationships": function_relationships,
+            "file_relationships": file_relationships,
         }
 
-    # ======================================================================
-    # NEW: EXTRACT ALL FUNCTIONS WITH METADATA
-    # ======================================================================
-    def _extract_all_functions(self, files_data: list[dict]) -> list[dict]:
-        """Extract all functions from all files with their metadata."""
+    # ==============================================================================
+    # Helper: Get docstring or comment summary for semantic meaning
+    def _extract_doc(self, node: ast.AST) -> str:
+        doc = ast.get_docstring(node)
+        if not doc:
+            return ""
+        return doc.strip().split("\n")[0][:120]
+
+    # ==============================================================================
+    def _extract_all_functions(self, files_data: list) -> list[dict]:
         all_functions = []
-        
+
         for file_info in files_data:
             file_path = file_info["path"]
-            
+
             for func in file_info.get("functions", []):
-                func_name = func.get("name", "")
-                if not func_name or func_name == "anonymous":
+                name = func.get("name", "")
+                if not name or name == "anonymous":
                     continue
-                
+
                 all_functions.append({
-                    "name": func_name,
+                    "name": name,
                     "file": file_path,
                     "start_line": func.get("start_line", 0),
                     "end_line": func.get("end_line", 0),
+                    "doc": func.get("doc", ""),
                     "type": "function",
                 })
-        
+
         return all_functions
 
-    # ======================================================================
-    # NEW: BUILD FUNCTION-TO-FUNCTION RELATIONSHIPS
-    # ======================================================================
+    # ==============================================================================
     def _build_function_relationships(self, files_data, file_index):
-        """Build function-level call graph."""
         relationships = []
-        
-        # Build a global function registry: func_name -> file_path
-        func_to_file: dict[str, str] = {}
+        func_to_file = {}
+
         for file_info in files_data:
             file_path = file_info["path"]
             for func in file_info.get("functions", []):
-                func_name = func.get("name", "")
-                if func_name and func_name != "anonymous":
-                    # If duplicate, keep first occurrence
-                    if func_name not in func_to_file:
-                        func_to_file[func_name] = file_path
-        
-        # For each file, match calls to known functions
+                fn = func["name"]
+                if fn not in func_to_file:
+                    func_to_file[fn] = file_path
+
         for file_info in files_data:
             source_file = file_info["path"]
+            source_functions = file_info.get("functions", [])
             calls = file_info.get("calls", [])
-            source_functions = [f["name"] for f in file_info.get("functions", [])]
-            
-            # For each call made in this file
+
             for called_func in calls:
-                if not called_func or called_func == "anonymous":
+                if called_func not in func_to_file:
                     continue
-                
-                # Check if this is a known function
-                if called_func in func_to_file:
-                    target_file = func_to_file[called_func]
-                    
-                    # Try to determine which function in source_file made this call
-                    # For now, we'll use a heuristic: if file has 1 function, that's the caller
-                    # Otherwise, we'll create relationships for all functions in the file
-                    
-                    if len(source_functions) == 1:
-                        # Single function file - clear caller
-                        caller = source_functions[0]
-                        relationships.append({
-                            "source": caller,
-                            "target": called_func,
-                            "type": "calls",
-                            "source_file": source_file,
-                            "target_file": target_file,
-                        })
-                    elif len(source_functions) > 1:
-                        # Multiple functions - create edges from each
-                        # This is conservative but shows all possible flows
-                        for caller in source_functions:
-                            relationships.append({
-                                "source": caller,
-                                "target": called_func,
-                                "type": "calls",
-                                "source_file": source_file,
-                                "target_file": target_file,
-                            })
-                    else:
-                        # No functions defined, use file name as caller
-                        file_name = source_file.split("/")[-1].replace(".py", "").replace(".js", "")
-                        relationships.append({
-                            "source": file_name,
-                            "target": called_func,
-                            "type": "calls",
-                            "source_file": source_file,
-                            "target_file": target_file,
-                        })
-        
-        # Deduplicate relationships
+
+                target_file = func_to_file[called_func]
+                caller_candidates = [f["name"] for f in source_functions]
+
+                if not caller_candidates and len(source_functions) == 1:
+                    caller_candidates = [source_functions[0]["name"]]
+
+                if not caller_candidates:
+                    caller_candidates = [source_file.split("/")[-1]]
+
+                for caller in caller_candidates:
+                    relationships.append({
+                        "source": caller,
+                        "target": called_func,
+                        "type": "calls",
+                        "source_file": source_file,
+                        "target_file": target_file,
+                    })
+
         seen = set()
-        unique_relationships = []
+        unique = []
         for rel in relationships:
-            key = (rel["source"], rel["target"], rel["type"])
+            key = (rel["source"], rel["target"])
             if key not in seen:
                 seen.add(key)
-                unique_relationships.append(rel)
-        
-        return unique_relationships
+                unique.append(rel)
 
-    # ======================================================================
-    # OLD: FILE-LEVEL RELATIONSHIPS (BACKWARD COMPATIBILITY)
-    # ======================================================================
+        return unique
+
+    # ==============================================================================
     def _build_file_relationships(self, files, file_index):
-        """Original file-level relationship builder (kept for backward compat)."""
         relationships = []
-        call_map: dict[str, set[str]] = defaultdict(set)
+        call_map = defaultdict(set)
 
-        # Imports → direct edges
         for file in files:
             src = file["path"]
             for imp in file["imports"]:
-                relationships.append({
-                    "source": src,
-                    "target": imp,
-                    "type": "import",
-                })
-
-            # collect calls
+                relationships.append({"source": src, "target": imp, "type": "import"})
             for c in file["calls"]:
                 call_map[src].add(c)
 
-        # match calls → to file functions
         for src, calls in call_map.items():
             for target_file, info in file_index.items():
-                function_names = {fn["name"] for fn in info.get("functions", [])}
-                if function_names.intersection(calls):
-                    relationships.append({
-                        "source": src,
-                        "target": target_file,
-                        "type": "call",
-                    })
+                fnames = {fn["name"] for fn in info.get("functions", [])}
+                if fnames.intersection(calls):
+                    relationships.append({"source": src, "target": target_file, "type": "call"})
 
         return relationships
 
-    # ======================================================================
-    # PYTHON PARSER (ENHANCED)
-    # ======================================================================
+    # ==============================================================================
     def _parse_python(self, path: Path, relative: str) -> dict[str, Any]:
         try:
             source = path.read_text(encoding="utf-8")
@@ -251,86 +200,63 @@ class ProjectParser:
 
         try:
             tree = ast.parse(source)
-        except SyntaxError:
-            return {
-                "path": relative,
-                "language": "python",
-                "imports": [],
-                "functions": [],
-                "calls": [],
-            }
+        except:
+            return {"path": relative, "language": "python", "imports": [], "functions": [], "calls": []}
 
         functions = []
         calls = []
         imports = []
 
         for node in ast.walk(tree):
-            # function definitions (with line numbers)
             if isinstance(node, ast.FunctionDef):
                 functions.append({
                     "name": node.name,
                     "start_line": node.lineno,
                     "end_line": node.end_lineno or node.lineno,
+                    "doc": self._extract_doc(node),
                 })
-            # function calls
             elif isinstance(node, ast.Call):
                 name = self._get_call_name(node.func)
                 if name:
                     calls.append(name)
-            # imports
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 imports.extend(self._get_import_names(node))
 
-        return {
-            "path": relative,
-            "language": "python",
-            "imports": sorted(set(imports)),
-            "functions": functions,
-            "calls": sorted(set(calls)),
-        }
+        return {"path": relative, "language": "python", "imports": sorted(set(imports)),
+                "functions": functions, "calls": sorted(set(calls))}
 
-    # ======================================================================
-    # JS PARSER
-    # ======================================================================
+    # ==============================================================================
     def _parse_js(self, path: Path, relative: str) -> dict[str, Any]:
         try:
             source = path.read_text(encoding="utf-8")
         except:
             source = ""
 
-        imports = [match.group("import").strip() for match in JS_IMPORT_RE.finditer(source)]
-
-        # functions
+        imports = [m.group("import").strip() for m in JS_IMPORT_RE.finditer(source)]
         functions = []
+        lines = source.split("\n")
+
         for match in JS_FUNCTION_RE.finditer(source):
-            name = (
-                match.group("name")
-                or match.group("varname")
-                or match.group("classname")
-                or "anonymous"
-            )
-            # Approximate line number
-            line_num = source[:match.start()].count('\n') + 1
-            functions.append({
-                "name": name,
-                "start_line": line_num,
-                "end_line": line_num,  # Approximate
-            })
+            name = match.group("name") or match.group("varname") or match.group("classname") or "anonymous"
+            line = source[:match.start()].count("\n") + 1
 
-        # calls
-        calls = [match.group("caller") for match in JS_CALL_RE.finditer(source)]
+            comments = []
+            for line_back in reversed(lines[:line - 1][-5:]):
+                stripped = line_back.strip()
+                if stripped.startswith("//"):
+                    comments.append(stripped[2:].strip())
+                else:
+                    break
+            doc = " ".join(reversed(comments))[:120]
 
-        return {
-            "path": relative,
-            "language": "javascript",
-            "imports": sorted(set(imports)),
-            "functions": functions,
-            "calls": sorted(set(calls)),
-        }
+            functions.append({"name": name, "start_line": line, "end_line": line, "doc": doc})
 
-    # ======================================================================
-    # HELPERS
-    # ======================================================================
+        calls = [m.group("caller") for m in JS_CALL_RE.finditer(source)]
+
+        return {"path": relative, "language": "javascript", "imports": sorted(set(imports)),
+                "functions": functions, "calls": sorted(set(calls))}
+
+    # ==============================================================================
     @staticmethod
     def _get_call_name(node):
         if isinstance(node, ast.Name):

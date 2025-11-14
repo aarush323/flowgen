@@ -6,8 +6,8 @@ from typing import Iterable
 
 
 class OllamaClient:
-    def __init__(self, model: str = "qwen2.5:3b", command: str = "ollama") -> None:
-        # Use Phi-3 Mini as the default model
+    def __init__(self, model: str = "mistral", command: str = "ollama") -> None:
+        # Use mistral as the default model
         self.model = model
         self.command = command
 
