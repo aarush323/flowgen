@@ -86,16 +86,162 @@ class ProjectParser:
             files_data.append(file_info)
             file_index[relative] = file_info
 
-        # Relationships between files
-        relationships = self._build_relationships(files_data, file_index)
+        # NEW: Build function-level data
+        all_functions = self._extract_all_functions(files_data)
+        function_relationships = self._build_function_relationships(files_data, file_index)
+        
+        # Keep old file-level relationships for backward compatibility
+        file_relationships = self._build_file_relationships(files_data, file_index)
 
         return {
             "files": files_data,
-            "relationships": relationships,
+            "functions": all_functions,  # NEW: Function list
+            "relationships": function_relationships,  # NEW: Function-level calls
+            "file_relationships": file_relationships,  # OLD: For backward compat
         }
 
     # ======================================================================
-    # PYTHON PARSER
+    # NEW: EXTRACT ALL FUNCTIONS WITH METADATA
+    # ======================================================================
+    def _extract_all_functions(self, files_data: list[dict]) -> list[dict]:
+        """Extract all functions from all files with their metadata."""
+        all_functions = []
+        
+        for file_info in files_data:
+            file_path = file_info["path"]
+            
+            for func in file_info.get("functions", []):
+                func_name = func.get("name", "")
+                if not func_name or func_name == "anonymous":
+                    continue
+                
+                all_functions.append({
+                    "name": func_name,
+                    "file": file_path,
+                    "start_line": func.get("start_line", 0),
+                    "end_line": func.get("end_line", 0),
+                    "type": "function",
+                })
+        
+        return all_functions
+
+    # ======================================================================
+    # NEW: BUILD FUNCTION-TO-FUNCTION RELATIONSHIPS
+    # ======================================================================
+    def _build_function_relationships(self, files_data, file_index):
+        """Build function-level call graph."""
+        relationships = []
+        
+        # Build a global function registry: func_name -> file_path
+        func_to_file: dict[str, str] = {}
+        for file_info in files_data:
+            file_path = file_info["path"]
+            for func in file_info.get("functions", []):
+                func_name = func.get("name", "")
+                if func_name and func_name != "anonymous":
+                    # If duplicate, keep first occurrence
+                    if func_name not in func_to_file:
+                        func_to_file[func_name] = file_path
+        
+        # For each file, match calls to known functions
+        for file_info in files_data:
+            source_file = file_info["path"]
+            calls = file_info.get("calls", [])
+            source_functions = [f["name"] for f in file_info.get("functions", [])]
+            
+            # For each call made in this file
+            for called_func in calls:
+                if not called_func or called_func == "anonymous":
+                    continue
+                
+                # Check if this is a known function
+                if called_func in func_to_file:
+                    target_file = func_to_file[called_func]
+                    
+                    # Try to determine which function in source_file made this call
+                    # For now, we'll use a heuristic: if file has 1 function, that's the caller
+                    # Otherwise, we'll create relationships for all functions in the file
+                    
+                    if len(source_functions) == 1:
+                        # Single function file - clear caller
+                        caller = source_functions[0]
+                        relationships.append({
+                            "source": caller,
+                            "target": called_func,
+                            "type": "calls",
+                            "source_file": source_file,
+                            "target_file": target_file,
+                        })
+                    elif len(source_functions) > 1:
+                        # Multiple functions - create edges from each
+                        # This is conservative but shows all possible flows
+                        for caller in source_functions:
+                            relationships.append({
+                                "source": caller,
+                                "target": called_func,
+                                "type": "calls",
+                                "source_file": source_file,
+                                "target_file": target_file,
+                            })
+                    else:
+                        # No functions defined, use file name as caller
+                        file_name = source_file.split("/")[-1].replace(".py", "").replace(".js", "")
+                        relationships.append({
+                            "source": file_name,
+                            "target": called_func,
+                            "type": "calls",
+                            "source_file": source_file,
+                            "target_file": target_file,
+                        })
+        
+        # Deduplicate relationships
+        seen = set()
+        unique_relationships = []
+        for rel in relationships:
+            key = (rel["source"], rel["target"], rel["type"])
+            if key not in seen:
+                seen.add(key)
+                unique_relationships.append(rel)
+        
+        return unique_relationships
+
+    # ======================================================================
+    # OLD: FILE-LEVEL RELATIONSHIPS (BACKWARD COMPATIBILITY)
+    # ======================================================================
+    def _build_file_relationships(self, files, file_index):
+        """Original file-level relationship builder (kept for backward compat)."""
+        relationships = []
+        call_map: dict[str, set[str]] = defaultdict(set)
+
+        # Imports → direct edges
+        for file in files:
+            src = file["path"]
+            for imp in file["imports"]:
+                relationships.append({
+                    "source": src,
+                    "target": imp,
+                    "type": "import",
+                })
+
+            # collect calls
+            for c in file["calls"]:
+                call_map[src].add(c)
+
+        # match calls → to file functions
+        for src, calls in call_map.items():
+            for target_file, info in file_index.items():
+                function_names = {fn["name"] for fn in info.get("functions", [])}
+                if function_names.intersection(calls):
+                    relationships.append({
+                        "source": src,
+                        "target": target_file,
+                        "type": "call",
+                    })
+
+        return relationships
+
+    # ======================================================================
+    # PYTHON PARSER (ENHANCED)
     # ======================================================================
     def _parse_python(self, path: Path, relative: str) -> dict[str, Any]:
         try:
@@ -119,9 +265,13 @@ class ProjectParser:
         imports = []
 
         for node in ast.walk(tree):
-            # function definitions
+            # function definitions (with line numbers)
             if isinstance(node, ast.FunctionDef):
-                functions.append({"name": node.name})
+                functions.append({
+                    "name": node.name,
+                    "start_line": node.lineno,
+                    "end_line": node.end_lineno or node.lineno,
+                })
             # function calls
             elif isinstance(node, ast.Call):
                 name = self._get_call_name(node.func)
@@ -159,7 +309,13 @@ class ProjectParser:
                 or match.group("classname")
                 or "anonymous"
             )
-            functions.append({"name": name})
+            # Approximate line number
+            line_num = source[:match.start()].count('\n') + 1
+            functions.append({
+                "name": name,
+                "start_line": line_num,
+                "end_line": line_num,  # Approximate
+            })
 
         # calls
         calls = [match.group("caller") for match in JS_CALL_RE.finditer(source)]
@@ -171,40 +327,6 @@ class ProjectParser:
             "functions": functions,
             "calls": sorted(set(calls)),
         }
-
-    # ======================================================================
-    # RELATIONSHIP BUILDER
-    # ======================================================================
-    def _build_relationships(self, files, file_index):
-        relationships = []
-        call_map: dict[str, set[str]] = defaultdict(set)
-
-        # Imports → direct edges
-        for file in files:
-            src = file["path"]
-            for imp in file["imports"]:
-                relationships.append({
-                    "source": src,
-                    "target": imp,
-                    "type": "import",
-                })
-
-            # collect calls
-            for c in file["calls"]:
-                call_map[src].add(c)
-
-        # match calls → to file functions
-        for src, calls in call_map.items():
-            for target_file, info in file_index.items():
-                function_names = {fn["name"] for fn in info.get("functions", [])}
-                if function_names.intersection(calls):
-                    relationships.append({
-                        "source": src,
-                        "target": target_file,
-                        "type": "call",
-                    })
-
-        return relationships
 
     # ======================================================================
     # HELPERS
