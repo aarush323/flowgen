@@ -1,3 +1,5 @@
+# app/diagram_fix.py
+
 from __future__ import annotations
 
 import re
@@ -42,12 +44,21 @@ def sanitize_label(text: str) -> str:
 
 def is_mermaid_valid(diagram: str) -> bool:
     """Very lightweight sanity check to prevent broken Mermaid output."""
+    # --- DEBUG LINE ADDED ---
+    print("🔍 DIAGRAM_FIX: Running is_mermaid_valid()...")
+    
     if not isinstance(diagram, str):
+        print("❌ DIAGRAM_FIX: Invalid type. Not a string.")
         return False
     if not diagram.startswith("flowchart TD"):
+        print("❌ DIAGRAM_FIX: Invalid format. Does not start with 'flowchart TD'.")
         return False
     if "-->" not in diagram:
+        print("❌ DIAGRAM_FIX: Invalid format. No arrows ('-->') found.")
         return False
+    
+    # --- DEBUG LINE ADDED ---
+    print("✅ DIAGRAM_FIX: is_mermaid_valid() returned True.")
     return True
 
 
@@ -77,7 +88,11 @@ def fix_mermaid(diagram: str) -> str:
       - sanitize everything
       - rebuild from scratch
     """
+    # --- DEBUG LINE ADDED ---
+    print("🔧 DIAGRAM_FIX: Running fix_mermaid() to attempt a repair...")
+
     if not isinstance(diagram, str) or not diagram.strip():
+        print("🔧 DIAGRAM_FIX: Input is empty or not a string. Returning fallback.")
         return _FALLBACK_DIAGRAM
 
     diagram = _normalize_text(diagram)
@@ -161,6 +176,11 @@ def fix_mermaid(diagram: str) -> str:
 
     final = "\n".join(lines)
 
+    if is_mermaid_valid(final):
+        print("✅ DIAGRAM_FIX: fix_mermaid() successfully repaired the diagram.")
+    else:
+        print("❌ DIAGRAM_FIX: fix_mermaid() failed to repair the diagram.")
+
     return final if is_mermaid_valid(final) else _FALLBACK_DIAGRAM
 
 
@@ -175,11 +195,17 @@ def ensure_valid(diagram: str) -> Tuple[str, Dict[str, bool]]:
         → repair it
         → if still invalid, fallback
     """
+    # --- DEBUG LINE ADDED ---
+    print("🛡️ DIAGRAM_FIX: Running ensure_valid() wrapper...")
+    
     if is_mermaid_valid(diagram):
+        print("✅ DIAGRAM_FIX: ensure_valid() found diagram is already valid. No fix needed.")
         return diagram, {"fixed": False, "valid": True}
 
     repaired = fix_mermaid(diagram)
     if is_mermaid_valid(repaired):
+        print("✅ DIAGRAM_FIX: ensure_valid() successfully repaired the diagram.")
         return repaired, {"fixed": True, "valid": True}
 
+    print("❌ DIAGRAM_FIX: ensure_valid() failed to repair. Returning final fallback.")
     return _FALLBACK_DIAGRAM, {"fixed": True, "valid": False}

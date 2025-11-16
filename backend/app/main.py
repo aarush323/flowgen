@@ -1,3 +1,5 @@
+# app/main.py
+
 from __future__ import annotations
 from dotenv import load_dotenv
 
@@ -81,6 +83,10 @@ async def upload_project(file: UploadFile = File(...)) -> AnalysisResponse:
     prompt = build_prompt(project_data)
     raw = client.generate(prompt)
 
+    # --- DEBUG LINE ADDED ---
+    # This will print the exact raw response from the LLM to your terminal.
+    print(f"DEBUG: Raw LLM output:\n---\n{raw}\n---")
+
     try:
         payload = json.loads(raw)
     except Exception as e:
@@ -104,46 +110,71 @@ async def upload_project(file: UploadFile = File(...)) -> AnalysisResponse:
 
 
 # =====================================================================================
-# PROMPT CREATOR
+# V2.3 - GROUPED COMPONENTS PROMPT CREATOR
 # =====================================================================================
 def build_prompt(project_data: dict[str, Any]) -> str:
-    minimal = {
-        "files": [
-            {
-                "id": re.sub(r"[^a-zA-Z0-9_]", "_", f["path"]),
-                "label": f["path"].split("/")[-1],
-            }
-            for f in project_data.get("files", [])[:120]
-        ],
-        "relationships": [
-            {
-                "source": re.sub(r"[^a-zA-Z0-9_]", "_", r["source"]),
-                "target": re.sub(r"[^a-zA-Z0-9_]", "_", r["target"]),
-                "type": r["type"],
-            }
-            for r in project_data.get("relationships", [])
-        ],
-    }
+    """
+    Creates a prompt that groups functions into subgraphs for better visualization.
+    """
 
-    structure_json = json.dumps(minimal, indent=2)
+    # --- 1. Extract all unique components that are actually connected ---
+    connected_components = set()
+    for rel in project_data.get("relationships", [])[:50]:
+        connected_components.add(rel.get("source", "Unknown"))
+        connected_components.add(rel.get("target", "Unknown"))
 
-    return textwrap.dedent(f"""
-You generate ONLY JSON. No text before or after.
+    # --- 2. Group functions by file for structured context ---
+    functions_by_file = defaultdict(list)
+    for func in project_data.get("functions", []):
+        # Only include functions that are part of the connected flow
+        if func.get("name") in connected_components:
+            file_path = func.get("file", "Unknown File")
+            doc = func.get("doc", "No description available.")[:80]
+            functions_by_file[file_path].append({
+                "name": func.get("name"),
+                "doc": doc
+            })
 
-FORMAT:
+    # --- 3. Prepare the structured list of relationships ---
+    relationships_summary = []
+    for rel in project_data.get("relationships", [])[:50]:
+        source = rel.get("source", "Unknown")
+        target = rel.get("target", "Unknown")
+        rel_type = rel.get("type", "unknown")
+        relationships_summary.append(f"- `{source}` --[{rel_type}]--> `{target}`")
+
+    # --- 4. Construct the final, grouped prompt ---
+    prompt = f"""
+You are an expert software architect visualizing a codebase's execution flow.
+Your task is to create a precise and well-organized Mermaid.js flowchart.
+
+**CONNECTED COMPONENTS (These are the ONLY items you should create nodes for):**
+{chr(10).join(list(connected_components))}
+
+**COMPONENT DETAILS GROUPED BY FILE:**
+{chr(10).join([f"**File: {file}**\n" + chr(10).join([f"- `{func['name']}` (Purpose: {func['doc']})" for func in funcs]) for file, funcs in functions_by_file.items()])}
+
+**RELATIONSHIPS (The exact connections to draw):**
+{chr(10).join(relationships_summary)}
+
+**CRITICAL INSTRUCTIONS FOR THE FLOWCHART:**
+1.  **Output ONLY a JSON object** with two keys: "diagram" and "summary".
+2.  **Node Creation:** You MUST ONLY create nodes for the items listed under "CONNECTED COMPONENTS".
+3.  **Diagram Content:**
+    - The "diagram" value must be a valid Mermaid.js flowchart string starting with `flowchart TD`.
+    - **Grouping:** Use `subgraph "File Path"` to group functions that belong to the same file. Place the function nodes inside their respective subgraphs. This is a critical requirement.
+    - Use rectangle nodes for functions: `function_name["Function Name"]`.
+    - For each UNIQUE relationship listed under "RELATIONSHIPS", draw EXACTLY ONE arrow. Do not draw multiple arrows between the same two nodes.
+    - Label arrows with the interaction type (e.g., `-- calls -->`).
+4.  **Summary Content:**
+    - The "summary" value must be a 4-8 sentence explanation of the project's architecture, focusing on the flow between the grouped components.
+
+**OUTPUT FORMAT (strictly follow this):**
 {{
-  "diagram": "flowchart TD\\n<NODES_AND_EDGES>",
-  "summary": "<4_to_8_sentences>"
+  "diagram": "flowchart TD\\n  subgraph \\"app/main.py\\"\\n    A[Main Entry]\\n  end\\n  subgraph \\"app/services/search.py\\"\\n    B[Search Logic]\\n  end\\n  A --> B",
+  "summary": "This project is structured with a main entry point in main.py that calls into core logic modules within the services directory."
 }}
 
-DIAGRAM RULES:
-- Must start with: flowchart TD
-- One node per file: id["label"]
-- Arrows: source --> target
-- Use ONLY the IDs given
-- Minimum 3 nodes, 2 arrows
-- No markdown
-
-PROJECT DATA:
-{structure_json}
-""").strip()
+Generate the diagram and summary based on the data and rules above.
+"""
+    return textwrap.dedent(prompt).strip()

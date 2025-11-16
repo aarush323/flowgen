@@ -1,3 +1,5 @@
+# app/parser.py
+
 from __future__ import annotations
 
 import ast
@@ -13,8 +15,7 @@ from typing import Any
 JS_IMPORT_RE = re.compile(
     r"""(?P<import>
         ^\s*import\s+[^;]+;\s*$|
-        ^\s*const\s+\w+\s*=\s*require\([^)]*\);\s*$
-    )""",
+        ^\s*const\s+\w+\s*=\s*require\([^)]*\);\s*$     )""",
     re.MULTILINE | re.VERBOSE,
 )
 
@@ -46,6 +47,14 @@ class ProjectParser:
         "static", "public",
     }
 
+    SKIP_PATTERNS = {
+        ".env", ".gitignore", "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+        "package.json", "package-lock.json", "yarn.lock", "tsconfig.json",
+        "vite.config.js", "vite.config.ts", "tailwind.config.js", "postcss.config.js",
+        "webpack.config.js", "rollup.config.js", "next.config.js",
+        "eslintrc.js", ".eslintrc.json", "prettierrc", ".prettierrc.json",
+    }
+
     MAX_FILES = 150
 
     # ==============================================================================
@@ -60,12 +69,14 @@ class ProjectParser:
         file_index = {}
 
         for file_path in extract_dir.rglob("*"):
-
             if any(skip in {p.lower() for p in file_path.parts} for skip in self.SKIP_FOLDERS):
                 continue
             if not file_path.is_file():
                 continue
             if file_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
+                continue
+            if file_path.name.lower() in self.SKIP_PATTERNS or \
+               any(file_path.name.lower().endswith(pattern) for pattern in ["config.js", "config.ts"]):
                 continue
             if len(files_data) >= self.MAX_FILES:
                 break
@@ -84,12 +95,66 @@ class ProjectParser:
         function_relationships = self._build_function_relationships(files_data, file_index)
         file_relationships = self._build_file_relationships(files_data, file_index)
 
+        # --- NEW: Infer semantic relationships ---
+        inferred_relationships = self._infer_database_relationships(files_data, file_index)
+
+        # Merge all relationships
+        all_relationships = function_relationships + inferred_relationships
+        
+        # De-duplicate the final list
+        final_relationships = self._deduplicate_relationships(all_relationships)
+
         return {
             "files": files_data,
             "functions": all_functions,
-            "relationships": function_relationships,
+            "relationships": final_relationships,
             "file_relationships": file_relationships,
         }
+
+    # ==============================================================================
+    # --- NEW: Infer database relationships based on keywords ---
+    def _infer_database_relationships(self, files_data: list[dict], file_index: dict) -> list[dict]:
+        """
+        Infers database relationships by looking for keywords in a file's function calls.
+        This is a heuristic to catch indirect interactions (e.g., ORM usage).
+        """
+        db_keywords = {"session", "db", "execute", "query", "add", "commit", "delete", "update", "engine"}
+        
+        # Identify potential database files by name
+        db_files = {path for path in file_index if "database" in path.lower() or "db" in path.lower()}
+        if not db_files:
+            return []
+
+        inferred = []
+        for file_info in files_data:
+            source_file = file_info["path"]
+            if source_file in db_files:
+                continue # Don't create a relationship from a db file to itself
+
+            # Check if any of the calls in the file look like a DB operation
+            calls = file_info.get("calls", [])
+            if any(keyword in call.lower() for call in calls for keyword in db_keywords):
+                # If so, create a relationship to the most likely DB file
+                target_db_file = min(db_files, key=lambda f: "database" in f.lower()) # Prefer 'database.py'
+                inferred.append({
+                    "source": source_file.split('/')[-1], # Use filename for cleaner nodes
+                    "target": target_db_file.split('/')[-1],
+                    "type": "uses_db",
+                    "source_file": source_file,
+                    "target_file": target_db_file,
+                })
+        return inferred
+
+    # --- NEW: Helper to de-duplicate relationships ---
+    def _deduplicate_relationships(self, relationships: list[dict]) -> list[dict]:
+        seen = set()
+        unique = []
+        for rel in relationships:
+            key = (rel["source"], rel["target"], rel["type"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(rel)
+        return unique
 
     # ==============================================================================
     # Helper: Get docstring or comment summary for semantic meaning
@@ -161,15 +226,7 @@ class ProjectParser:
                         "target_file": target_file,
                     })
 
-        seen = set()
-        unique = []
-        for rel in relationships:
-            key = (rel["source"], rel["target"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(rel)
-
-        return unique
+        return self._deduplicate_relationships(relationships)
 
     # ==============================================================================
     def _build_file_relationships(self, files, file_index):
@@ -262,6 +319,7 @@ class ProjectParser:
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
+            # For chained calls like db.session.execute(), get the last part
             return node.attr
         return None
 
