@@ -28,7 +28,7 @@ load_dotenv()
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
-print("Loaded key:", apikey is not None)
+print("API Key loaded successfully." if API_KEY else "API Key NOT found.")
 
 client = OpenRouterClient()
 parser = ProjectParser()
